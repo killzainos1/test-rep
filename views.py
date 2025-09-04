@@ -1,196 +1,169 @@
-from django.contrib.auth import authenticate,get_user_model
-from rest_framework.authtoken.models import Token
+# accounts/views.py
+from rest_framework import generics, status, permissions
 from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.permissions import AllowAny
-from rest_framework.decorators import api_view, authentication_classes, permission_classes
-from rest_framework.authentication import TokenAuthentication
+from rest_framework_simplejwt.tokens import RefreshToken
+from .serializers import RegisterSerializer,LoginSerializer,LogoutSerializer,PasswordResetRequestSerializer,PasswordResetConfirmSerializer,ActivateUserSerializer
+from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
-from rest_framework_simplejwt.tokens import RefreshToken, TokenError
-from django.contrib.auth.tokens import default_token_generator
-from django.utils.http import urlsafe_base64_encode
-from django.contrib.auth.models import User
+from django.contrib.auth import get_user_model
 from django.utils.encoding import force_bytes,force_str
-from .emails import send_reset_password_email
-from django.utils.http import urlsafe_base64_decode
-from django.shortcuts import get_object_or_404
+from django.utils.http import urlsafe_base64_encode,urlsafe_base64_decode
+from django.core.mail import send_mail
+from django.contrib.auth.tokens import default_token_generator
 
+User = get_user_model()
 
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def register_view(request):
-    username = request.data.get("username")
-    email = request.data.get("email")
-    password = request.data.get("password")
+class RegisterView(generics.CreateAPIView):
+    serializer_class = RegisterSerializer
+    permission_classes = [permissions.AllowAny]
 
-    if not username or not password or not email:
-        return Response({"error": "نام کاربری، ایمیل و رمز عبور الزامی است."},
-                        status=status.HTTP_400_BAD_REQUEST)
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
 
-    if len(password) < 6:
-        return Response({"error": "رمز عبور باید حداقل 6 کاراکتر باشد."},
-                        status=status.HTTP_400_BAD_REQUEST)
-
-    if User.objects.filter(username=username).exists():
-        return Response({"error": "این نام کاربری قبلاً استفاده شده است."},
-                        status=status.HTTP_400_BAD_REQUEST)
-
-    if User.objects.filter(email=email).exists():
-        return Response({"error": "این ایمیل قبلاً استفاده شده است."},
-                        status=status.HTTP_400_BAD_REQUEST)
-
-    user = User.objects.create_user(username=username, email=email, password=password)
-
-    refresh = RefreshToken.for_user(user)
-    return Response({
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-        },
-        "tokens": {
-            "refresh": str(refresh),
-            "access": str(refresh.access_token),
-        }
-    }, status=status.HTTP_201_CREATED)
-
-@api_view(['GET'])
-@authentication_classes([TokenAuthentication])
-@permission_classes([IsAuthenticated])
-def secure_endpoint(request):
-    user = request.user
-    return Response({
-        "message": f"Hello, {user.username}. You are authenticated!"
-    })
-
-@api_view(['POST'])
-@permission_classes([AllowAny]) 
-def login_view(request):
-    username = request.data.get("username")
-    password = request.data.get("password")
-
-    if not username or not password:
-        return Response(
-            {"error": "نام کاربری و رمز عبور الزامی است."},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    user = authenticate(username=username, password=password)
-    if user is not None:
         refresh = RefreshToken.for_user(user)
+        tokens = {
+            "refresh": str(refresh),
+            "access": str(refresh.access_token)
+        }
+
         return Response({
+            "message": "ثبت‌ نام موفق بود.",
             "user": {
                 "id": user.id,
                 "username": user.username,
                 "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name
             },
-            "tokens": {
-                "refresh": str(refresh),
-                "access": str(refresh.access_token),
-            }
+            "tokens": tokens
+        }, status=status.HTTP_201_CREATED)
+
+class LoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = LoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.validated_data['user']
+
+        refresh = RefreshToken.for_user(user)
+        tokens = {
+            "refresh": str(refresh),
+            "access": str(refresh.access_token)
+        }
+
+        return Response({
+            "message": "ورود موفق بود.",
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name
+            },
+            "tokens": tokens
         })
-    else:
-        return Response(
-            {"error": "نام کاربری یا رمز عبور اشتباه است."},
-            status=status.HTTP_401_UNAUTHORIZED
+               
+class LogoutView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = LogoutSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        refresh_token = serializer.validated_data["refresh"]
+
+        try:
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+            return Response({"message": "خروج با موفقیت انجام شد."})
+        except Exception:
+            return Response({"error": "توکن نامعتبر یا منقضی شده است."}, status=status.HTTP_400_BAD_REQUEST)
+
+class PasswordResetRequestView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data["email"]
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({"message": "اگر ایمیل موجود باشد، لینک تغییر رمز ارسال می‌شود."})
+
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+        token = default_token_generator.make_token(user)
+        reset_link = f"http://localhost:8000/api/accounts/reset-password-confirm/{uid}/{token}/"
+
+        send_mail(
+            subject="بازیابی رمز عبور",
+            message=f"برای تغییر رمز روی لینک زیر کلیک کنید:\n{reset_link}",
+            from_email="noreply@example.com",
+            recipient_list=[user.email],
+            fail_silently=False
         )
-        
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def logout_view(request):
-    try:
-        refresh_token = request.data.get("refresh")
-        if not refresh_token:
-            return Response({"error": "Refresh token الزامی است."},
-                            status=status.HTTP_400_BAD_REQUEST)
 
-        token = RefreshToken(refresh_token)
-        token.blacklist()
+        return Response({"message": "اگر ایمیل موجود باشد، لینک تغییر رمز ارسال می‌شود."})
+       
+class PasswordResetConfirmView(APIView):
+    permission_classes = [permissions.AllowAny]
 
-        return Response({"message": "خروج موفقیت‌آمیز بود."},
-                        status=status.HTTP_205_RESET_CONTENT)
-    except TokenError:
-        return Response({"error": "توکن معتبر نیست یا قبلاً بلاک شده است."},
-                        status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        return Response({"error": "خطایی رخ داد."},
-                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def logout_all_view(request):
-    try:
-        tokens = RefreshToken.for_user(request.user)
-        request.user.auth_token_set.all().delete()
-        return Response({"message": "خروج از تمام دستگاه‌ها انجام شد."},
-                        status=status.HTTP_205_RESET_CONTENT)
-    except Exception as e:
-        return Response({"error": "خطایی رخ داد."},
-                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
-@api_view(["POST"])
-@permission_classes([AllowAny])
-def password_reset_request_view(request):
-    email = request.data.get("email")
+    def post(self, request, uidb64, token):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
-    if not email:
-        return Response({"error": "ایمیل الزامی است."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            uid = force_str(urlsafe_base64_decode(uidb64))
+            user = User.objects.get(pk=uid)
+        except:
+            return Response({"error": "لینک نامعتبر است."}, status=status.HTTP_400_BAD_REQUEST)
 
-    try:
-        user = User.objects.get(email=email)
-    except User.DoesNotExist:
-        return Response({"error": "کاربری با این ایمیل پیدا نشد."}, status=status.HTTP_404_NOT_FOUND)
+        if not default_token_generator.check_token(user, token):
+            return Response({"error": "توکن نامعتبر یا منقضی شده است."}, status=status.HTTP_400_BAD_REQUEST)
 
-
-    uid = urlsafe_base64_encode(force_bytes(user.pk))
-    token = default_token_generator.make_token(user)
-
-    reset_link = f"http://localhost:8000/reset-password-confirm/{uid}/{token}/"
-
-    
-    send_reset_password_email(user, reset_link)
-
-    return Response({"message": "ایمیل بازیابی ارسال شد."}, status=status.HTTP_200_OK)
-
-@api_view(["POST"])
-@permission_classes([AllowAny])
-def password_reset_confirm_view(request, uid, token):
-    new_password = request.data.get("new_password")
-
-    if not new_password:
-        return Response({"error": "رمز عبور جدید الزامی است."}, status=status.HTTP_400_BAD_REQUEST)
-
-    try:
-        uid = urlsafe_base64_decode(uid).decode()
-        user = User.objects.get(pk=uid)
-    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
-        return Response({"error": "کاربر معتبر نیست."}, status=status.HTTP_400_BAD_REQUEST)
-
-    if not default_token_generator.check_token(user, token):
-        return Response({"error": "توکن معتبر نیست یا منقضی شده است."}, status=status.HTTP_400_BAD_REQUEST)
-
-    user.set_password(new_password)
-    user.save()
-
-    return Response({"message": "رمز عبور با موفقیت تغییر یافت."}, status=status.HTTP_200_OK)
-
-User = get_user_model()
-
-@api_view(['GET'])
-@permission_classes([AllowAny])
-def activate_user(request, uidb64, token):
-    try:
-        uid = force_str(urlsafe_base64_decode(uidb64))
-        user = get_object_or_404(User, pk=uid)
-    except (TypeError, ValueError, OverflowError):
-        return Response({"error": "لینک فعال‌سازی نامعتبر است."}, status=status.HTTP_400_BAD_REQUEST)
-
-    if default_token_generator.check_token(user, token):
-        if user.is_active:
-            return Response({"message": "حساب کاربری شما قبلاً فعال شده است."})
-        user.is_active = True
+        user.set_password(serializer.validated_data['new_password'])
         user.save()
-        return Response({"message": "حساب کاربری شما با موفقیت فعال شد."})
-    else:
-        return Response({"error": "لینک فعال‌سازی نامعتبر یا منقضی شده است."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"message": "رمز عبور با موفقیت تغییر کرد."})
+    
+class ActivateUserView(APIView):
+    permission_classes = [permissions.AllowAny]
 
+    def get(self, request, uidb64, token):
+        serializer = ActivateUserSerializer(data={"uidb64": uidb64, "token": token})
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            uid = force_str(urlsafe_base64_decode(serializer.validated_data['uidb64']))
+            user = User.objects.get(pk=uid)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+            return Response({"error": "لینک فعال‌سازی نامعتبر است."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if user.is_active:
+            return Response({"message": "حساب شما قبلاً فعال شده است."})
+
+        if default_token_generator.check_token(user, serializer.validated_data['token']):
+            user.is_active = True
+            user.save()
+
+            refresh = RefreshToken.for_user(user)
+            tokens = {
+                "refresh": str(refresh),
+                "access": str(refresh.access_token)
+            }
+
+            return Response({
+                "message": "حساب کاربری شما با موفقیت فعال شد.",
+                "user": {
+                    "id": user.id,
+                    "username": user.username,
+                    "email": user.email,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name
+                },
+                "tokens": tokens
+            }, status=status.HTTP_200_OK)
+
+        return Response({"error": "لینک فعال‌سازی نامعتبر یا منقضی شده است."}, status=status.HTTP_400_BAD_REQUEST)

@@ -1,4 +1,4 @@
-from django.contrib.auth import authenticate
+from django.contrib.auth import authenticate,get_user_model
 from rest_framework.authtoken.models import Token
 from rest_framework.response import Response
 from rest_framework import status
@@ -10,9 +10,11 @@ from rest_framework_simplejwt.tokens import RefreshToken, TokenError
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.http import urlsafe_base64_encode
 from django.contrib.auth.models import User
-from django.utils.encoding import force_bytes
+from django.utils.encoding import force_bytes,force_str
 from .emails import send_reset_password_email
 from django.utils.http import urlsafe_base64_decode
+from django.shortcuts import get_object_or_404
+
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -171,3 +173,24 @@ def password_reset_confirm_view(request, uid, token):
     user.save()
 
     return Response({"message": "رمز عبور با موفقیت تغییر یافت."}, status=status.HTTP_200_OK)
+
+User = get_user_model()
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def activate_user(request, uidb64, token):
+    try:
+        uid = force_str(urlsafe_base64_decode(uidb64))
+        user = get_object_or_404(User, pk=uid)
+    except (TypeError, ValueError, OverflowError):
+        return Response({"error": "لینک فعال‌سازی نامعتبر است."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if default_token_generator.check_token(user, token):
+        if user.is_active:
+            return Response({"message": "حساب کاربری شما قبلاً فعال شده است."})
+        user.is_active = True
+        user.save()
+        return Response({"message": "حساب کاربری شما با موفقیت فعال شد."})
+    else:
+        return Response({"error": "لینک فعال‌سازی نامعتبر یا منقضی شده است."}, status=status.HTTP_400_BAD_REQUEST)
+
